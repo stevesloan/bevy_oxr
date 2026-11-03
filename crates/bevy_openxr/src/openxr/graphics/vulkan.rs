@@ -18,7 +18,7 @@ use crate::types::{AppInfo, OxrExtensions, Result, WgpuGraphics};
 #[cfg(not(target_os = "android"))]
 const VK_TARGET_VERSION: Version = Version::new(1, 2, 0);
 #[cfg(target_os = "android")]
-const VK_TARGET_VERSION: Version = Version::new(1, 1, 0);
+const VK_TARGET_VERSION: Version = Version::new(1, 3, 0);
 
 const VK_TARGET_VERSION_ASH: u32 = vk::make_api_version(
     0,
