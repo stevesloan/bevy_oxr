@@ -229,6 +229,29 @@ impl OxrFrameStream {
 #[derive(Resource, Deref, DerefMut)]
 pub struct OxrFrameWaiter(pub openxr::FrameWaiter);
 
+/// Keeps wgpu off the Vulkan queue while the runtime is using it.
+///
+/// `XR_KHR_vulkan_enable` has the application externally synchronise the queue
+/// it gave the runtime across `xrBeginFrame`, `xrEndFrame`,
+/// `xrAcquireSwapchainImage` and `xrReleaseSwapchainImage`. This is the lock
+/// wgpu's Vulkan backend holds around its own queue calls; the frame loop takes
+/// it around each of those four, on whichever thread makes them.
+#[derive(Resource, Clone)]
+pub struct OxrQueueLock(wgpu_hal::vulkan::ExternalQueueLock);
+
+impl OxrQueueLock {
+    /// `None` when `queue` isn't a Vulkan queue.
+    pub fn new(queue: &wgpu::Queue) -> Option<Self> {
+        // SAFETY: the hal queue is only asked for its lock, and isn't kept.
+        let hal_queue = unsafe { queue.as_hal::<wgpu_hal::vulkan::Api>() }?;
+        Some(Self(hal_queue.external_lock()))
+    }
+
+    pub fn lock(&self) -> wgpu_hal::vulkan::ExternalQueueGuard<'_> {
+        self.0.lock()
+    }
+}
+
 /// Graphics agnostic wrapper around [openxr::Swapchain]
 #[derive(Resource)]
 pub struct OxrSwapchain(pub GraphicsWrap<Self>);
