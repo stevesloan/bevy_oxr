@@ -12,6 +12,7 @@ use bevy_render::{
     Render, RenderApp,
     extract_resource::ExtractResourcePlugin,
     pipelined_rendering::PipelinedRenderingPlugin,
+    renderer::RenderQueue,
     texture::{ManualTextureView, ManualTextureViews},
     view::ExtractedView,
 };
@@ -109,6 +110,7 @@ impl Plugin for OxrRenderPlugin {
             .add_systems(
                 Render,
                 (
+                    init_queue_lock.run_if(|lock: Option<Res<OxrQueueLock>>| lock.is_none()),
                     begin_frame,
                     insert_texture_views,
                     locate_views,
@@ -287,11 +289,15 @@ pub fn insert_texture_views(
     mut manual_texture_views: ResMut<ManualTextureViews>,
     graphics_info: Res<OxrCurrentSessionConfig>,
     frame_state: Res<OxrFrameState>,
+    queue_lock: Option<Res<OxrQueueLock>>,
 ) {
     if !frame_state.should_render {
         return;
     }
-    let index = swapchain.acquire_image().expect("Failed to acquire image");
+    let index = {
+        let _queue = queue_lock.as_ref().map(|lock| lock.lock());
+        swapchain.acquire_image().expect("Failed to acquire image")
+    };
     let image = &swapchain_images[index as usize];
 
     for i in 0..2 {
@@ -330,11 +336,31 @@ pub fn add_texture_view(
     handle
 }
 
-pub fn begin_frame(mut frame_stream: ResMut<OxrFrameStream>) {
+/// Exclusive so the lock is in place for this frame's `xrBeginFrame`, not the
+/// next one's.
+pub fn init_queue_lock(world: &mut World) {
+    let Some(lock) = world
+        .get_resource::<RenderQueue>()
+        .and_then(|queue| OxrQueueLock::new(queue))
+    else {
+        return;
+    };
+    world.insert_resource(lock);
+}
+
+pub fn begin_frame(
+    mut frame_stream: ResMut<OxrFrameStream>,
+    queue_lock: Option<Res<OxrQueueLock>>,
+) {
+    let _queue = queue_lock.as_ref().map(|lock| lock.lock());
     frame_stream.begin().expect("Failed to begin frame");
 }
 
-pub fn release_image(mut swapchain: ResMut<OxrSwapchain>, state: Res<OxrFrameState>) {
+pub fn release_image(
+    mut swapchain: ResMut<OxrSwapchain>,
+    state: Res<OxrFrameState>,
+    queue_lock: Option<Res<OxrQueueLock>>,
+) {
     if !state.should_render {
         return;
     }
@@ -344,6 +370,7 @@ pub fn release_image(mut swapchain: ResMut<OxrSwapchain>, state: Res<OxrFrameSta
         .attach_current_thread(|_env| -> jni::errors::Result<()> { Ok(()) })
         .unwrap();
     let _span = debug_span!("xr_release_image").entered();
+    let _queue = queue_lock.as_ref().map(|lock| lock.lock());
     swapchain.release_image().unwrap();
 }
 
@@ -353,6 +380,7 @@ pub fn end_frame(world: &mut World) {
         .unwrap()
         .attach_current_thread(|_env| -> jni::errors::Result<()> { Ok(()) })
         .unwrap();
+    let queue_lock = world.get_resource::<OxrQueueLock>().cloned();
     world.resource_scope::<OxrFrameStream, ()>(|world, mut frame_stream| {
         let mut layers = vec![];
         let frame_state = world.resource::<OxrFrameState>();
@@ -367,6 +395,7 @@ pub fn end_frame(world: &mut World) {
         drop(_span);
         let layers: Vec<_> = layers.iter().map(Box::as_ref).collect();
         let _span = debug_span!("xr_end_frame").entered();
+        let _queue = queue_lock.as_ref().map(|lock| lock.lock());
         if let Err(e) = frame_stream.end(
             frame_state.predicted_display_time,
             world.resource::<OxrEnvironmentBlendModes>().blend_mode(),

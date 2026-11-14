@@ -39,6 +39,17 @@ thiserror = "2.0.3"
 wgpu = "30"
 wgpu-hal = "30"
 
+# wgpu 30.0.1 plus `vulkan::Queue::external_lock`, which `OxrQueueLock` takes
+# around the OpenXR calls that use the Vulkan queue. Every wgpu crate wgpu-hal
+# depends on is patched so one copy of each resolves. Drop once wgpu offers its
+# own way to share the queue.
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/stevesloan/wgpu.git", rev = "920457d862de7d1dd79cf331420e7295e014a09f" }
+wgpu-types = { git = "https://github.com/stevesloan/wgpu.git", rev = "920457d862de7d1dd79cf331420e7295e014a09f" }
+wgpu-naga-bridge = { git = "https://github.com/stevesloan/wgpu.git", rev = "920457d862de7d1dd79cf331420e7295e014a09f" }
+naga = { git = "https://github.com/stevesloan/wgpu.git", rev = "920457d862de7d1dd79cf331420e7295e014a09f" }
+naga-types = { git = "https://github.com/stevesloan/wgpu.git", rev = "920457d862de7d1dd79cf331420e7295e014a09f" }
+
 # Enable a small amount of optimization in the dev profile.
 [profile.dev]
 opt-level = 1
