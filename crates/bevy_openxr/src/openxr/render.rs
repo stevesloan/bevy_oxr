@@ -20,8 +20,8 @@ use bevy_render::{
 use bevy_mod_xr::{
     camera::{Fov, XrCamera, XrProjection, XrViewInit, calculate_projection},
     session::{
-        XrFirst, XrHandleEvents, XrPreDestroySession, XrRenderSystems, XrRootTransform,
-        XrSessionCreated,
+        XrFirst, XrHandleEvents, XrPreDestroySession, XrPreSessionEnd, XrRenderSystems,
+        XrRootTransform, XrSessionCreated,
     },
     spaces::XrPrimaryReferenceSpace,
 };
@@ -29,7 +29,11 @@ use bevy_transform::{TransformSystems, components::Transform};
 use openxr::ViewStateFlags;
 
 use crate::{helper_traits::ToTransform as _, init::should_run_frame_loop, resources::*};
-use crate::{layer_builder::ProjectionLayer, session::OxrSession};
+use crate::{
+    frame_submit::{EndFrame, OxrFrameSubmitter, reclaim_frame_stream, wait_for_frame_end},
+    layer_builder::{DetachedLayer, ProjectionLayer},
+    session::OxrSession,
+};
 
 use super::environment_blend_mode::OxrEnvironmentBlendModes;
 
@@ -42,6 +46,11 @@ pub struct OxrRenderEnd;
 pub struct OxrRenderPlugin {
     pub spawn_cameras: bool,
     pub default_wait_frame: bool,
+    /// Run `xrEndFrame` on its own thread, so a runtime that blocks in it
+    /// doesn't hold the render world. See [`frame_submit`](crate::frame_submit).
+    /// A frame whose layers can't be [detached](crate::layer_builder::CompositionLayer::detach)
+    /// ends on the render thread regardless.
+    pub end_frame_off_thread: bool,
 }
 
 impl Default for OxrRenderPlugin {
@@ -49,6 +58,7 @@ impl Default for OxrRenderPlugin {
         Self {
             spawn_cameras: true,
             default_wait_frame: true,
+            end_frame_off_thread: true,
         }
     }
 }
@@ -103,8 +113,20 @@ impl Plugin for OxrRenderPlugin {
         )
         .init_resource::<OxrViews>();
 
+        let submitter = self.end_frame_off_thread.then(OxrFrameSubmitter::new);
+        if let Some(submitter) = &submitter {
+            // `xrEndSession` must not race a frame still being ended.
+            app.insert_resource(submitter.clone())
+                .add_systems(XrPreSessionEnd, wait_for_frame_end);
+        }
+
         let render_app = app.sub_app_mut(RenderApp);
 
+        if let Some(submitter) = submitter {
+            render_app
+                .insert_resource(submitter)
+                .add_systems(XrPreDestroySession, reclaim_frame_stream);
+        }
         render_app
             .add_systems(XrPreDestroySession, clean_views)
             .add_systems(
@@ -348,10 +370,13 @@ pub fn init_queue_lock(world: &mut World) {
     world.insert_resource(lock);
 }
 
-pub fn begin_frame(
-    mut frame_stream: ResMut<OxrFrameStream>,
-    queue_lock: Option<Res<OxrQueueLock>>,
-) {
+/// `xrBeginFrame`, once the previous frame's `xrEndFrame` has returned.
+pub fn begin_frame(world: &mut World) {
+    reclaim_frame_stream(world);
+    let queue_lock = world.get_resource::<OxrQueueLock>().cloned();
+    let Some(mut frame_stream) = world.get_resource_mut::<OxrFrameStream>() else {
+        return;
+    };
     let _queue = queue_lock.as_ref().map(|lock| lock.lock());
     frame_stream.begin().expect("Failed to begin frame");
 }
@@ -374,16 +399,40 @@ pub fn release_image(
     swapchain.release_image().unwrap();
 }
 
+/// `xrEndFrame`: handed to the [`OxrFrameSubmitter`] when there is one and
+/// every layer can travel, otherwise made here.
 pub fn end_frame(world: &mut World) {
+    let queue_lock = world.get_resource::<OxrQueueLock>().cloned();
+    let frame_state = world.resource::<OxrFrameState>().clone();
+    let blend_mode = world.resource::<OxrEnvironmentBlendModes>().blend_mode();
+
+    if let Some(submitter) = world.get_resource::<OxrFrameSubmitter>().cloned() {
+        let _span = debug_span!("get layers").entered();
+        let layers = world
+            .get_resource::<OxrFrameStream>()
+            .and_then(|frame_stream| detach_layers(world, frame_stream, frame_state.should_render));
+        drop(_span);
+        if let Some(layers) = layers
+            && let Some(stream) = world.remove_resource::<OxrFrameStream>()
+        {
+            submitter.submit(EndFrame {
+                stream,
+                display_time: frame_state.predicted_display_time,
+                blend_mode,
+                layers,
+                queue_lock,
+            });
+            return;
+        }
+    }
+
     #[cfg(target_os = "android")]
     jni::JavaVM::singleton()
         .unwrap()
         .attach_current_thread(|_env| -> jni::errors::Result<()> { Ok(()) })
         .unwrap();
-    let queue_lock = world.get_resource::<OxrQueueLock>().cloned();
     world.resource_scope::<OxrFrameStream, ()>(|world, mut frame_stream| {
         let mut layers = vec![];
-        let frame_state = world.resource::<OxrFrameState>();
         let _span = debug_span!("get layers").entered();
         if frame_state.should_render {
             for layer in world.resource::<OxrRenderLayers>().iter() {
@@ -396,12 +445,34 @@ pub fn end_frame(world: &mut World) {
         let layers: Vec<_> = layers.iter().map(Box::as_ref).collect();
         let _span = debug_span!("xr_end_frame").entered();
         let _queue = queue_lock.as_ref().map(|lock| lock.lock());
-        if let Err(e) = frame_stream.end(
-            frame_state.predicted_display_time,
-            world.resource::<OxrEnvironmentBlendModes>().blend_mode(),
-            &layers,
-        ) {
+        if let Err(e) = frame_stream.end(frame_state.predicted_display_time, blend_mode, &layers) {
             error!("Failed to end frame stream: {e}");
         }
     });
+}
+
+/// This frame's layers as copies that borrow nothing from `world`, or `None`
+/// if any of them can't be copied that way.
+fn detach_layers(
+    world: &World,
+    frame_stream: &OxrFrameStream,
+    should_render: bool,
+) -> Option<Vec<Box<dyn DetachedLayer>>> {
+    let mut detached = vec![];
+    if !should_render {
+        return Some(detached);
+    }
+    for (i, provider) in world.resource::<OxrRenderLayers>().iter().enumerate() {
+        let Some(layer) = provider.get(world) else {
+            continue;
+        };
+        if !frame_stream.accepts(layer.as_ref()) {
+            error!(
+                "Composition layer {i} uses a different graphics api from the frame stream. Excluding layer from frame submission."
+            );
+            continue;
+        }
+        detached.push(layer.detach()?);
+    }
+    Some(detached)
 }

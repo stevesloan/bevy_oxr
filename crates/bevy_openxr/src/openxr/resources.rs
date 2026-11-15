@@ -7,7 +7,7 @@ use bevy_render::extract_resource::ExtractResource;
 
 use crate::error::OxrError;
 use crate::graphics::*;
-use crate::layer_builder::{CompositionLayer, LayerProvider};
+use crate::layer_builder::{CompositionLayer, DetachedLayer, LayerProvider};
 use crate::session::{OxrSession, OxrSessionCreateNextChain};
 use crate::types::Result as OxrResult;
 use crate::types::*;
@@ -218,6 +218,41 @@ impl OxrFrameStream {
                 }
 
                 Ok(stream.end(display_time, environment_blend_mode, new_layers.as_slice())?)
+            }
+        )
+    }
+
+    /// Whether `layer` was built for the graphics api this stream submits to.
+    /// [`end`](Self::end) leaves out a layer that wasn't.
+    pub fn accepts(&self, layer: &dyn CompositionLayer) -> bool {
+        graphics_match!(
+            &self.0;
+            _stream => layer
+                .swapchain()
+                .is_none_or(|swapchain| swapchain.0.using_graphics::<Api>())
+        )
+    }
+
+    /// [`end`](Self::end) for layers already checked with
+    /// [`accepts`](Self::accepts) and cut loose from the world by
+    /// [`CompositionLayer::detach`].
+    pub fn end_detached(
+        &mut self,
+        display_time: openxr::Time,
+        environment_blend_mode: openxr::EnvironmentBlendMode,
+        layers: &[Box<dyn DetachedLayer>],
+    ) -> OxrResult<()> {
+        graphics_match!(
+            &mut self.0;
+            stream => {
+                let headers: Vec<_> = layers
+                    .iter()
+                    .map(|layer| unsafe {
+                        #[allow(clippy::missing_transmute_annotations)]
+                        std::mem::transmute(layer.header())
+                    })
+                    .collect();
+                Ok(stream.end(display_time, environment_blend_mode, headers.as_slice())?)
             }
         )
     }

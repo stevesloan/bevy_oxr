@@ -21,6 +21,7 @@ pub mod environment_blend_mode;
 pub mod error;
 pub mod exts;
 pub mod features;
+pub mod frame_submit;
 pub mod graphics;
 pub mod helper_traits;
 pub mod init;
