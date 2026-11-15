@@ -177,6 +177,53 @@ impl Default for CompositionLayerProjectionView<'_> {
 pub unsafe trait CompositionLayer<'a> {
     fn swapchain(&self) -> Option<&'a OxrSwapchain>;
     fn header(&self) -> &sys::CompositionLayerBaseHeader;
+    /// A copy of this layer that borrows nothing, so `xrEndFrame` can run on
+    /// another thread after the world it was built from has moved on.
+    ///
+    /// `None` keeps the frame's `xrEndFrame` on the render thread, which is
+    /// always correct. That is the default, and what a layer must answer if
+    /// its struct points at anything it can't carry along.
+    fn detach(&self) -> Option<Box<dyn DetachedLayer>> {
+        None
+    }
+}
+
+/// A composition layer that owns everything its struct points to, apart from
+/// OpenXR handles.
+///
+/// # Safety
+/// As for [`CompositionLayer`]. In addition, every pointer reachable from the
+/// header must stay valid for as long as this value lives, wherever it is moved.
+pub unsafe trait DetachedLayer: Send {
+    fn header(&self) -> &sys::CompositionLayerBaseHeader;
+}
+
+struct DetachedProjection {
+    inner: sys::CompositionLayerProjection,
+    // `inner.views` points into this allocation, which moving the struct
+    // leaves where it is.
+    _views: Vec<sys::CompositionLayerProjectionView>,
+}
+
+// SAFETY: the raw pointers are to the struct's own heap allocation; the rest
+// are OpenXR handles, which the runtime accepts from any thread.
+unsafe impl Send for DetachedProjection {}
+
+unsafe impl DetachedLayer for DetachedProjection {
+    fn header(&self) -> &sys::CompositionLayerBaseHeader {
+        unsafe { mem::transmute(&self.inner) }
+    }
+}
+
+struct DetachedPassthroughFB(sys::CompositionLayerPassthroughFB);
+
+// SAFETY: holds no pointer but a null `next`.
+unsafe impl Send for DetachedPassthroughFB {}
+
+unsafe impl DetachedLayer for DetachedPassthroughFB {
+    fn header(&self) -> &sys::CompositionLayerBaseHeader {
+        unsafe { mem::transmute(&self.0) }
+    }
 }
 #[derive(Clone)]
 pub struct CompositionLayerProjection<'a> {
@@ -230,6 +277,21 @@ unsafe impl<'a> CompositionLayer<'a> for CompositionLayerProjection<'a> {
     fn header(&self) -> &sys::CompositionLayerBaseHeader {
         unsafe { mem::transmute(&self.inner) }
     }
+
+    fn detach(&self) -> Option<Box<dyn DetachedLayer>> {
+        // An extension chain is someone else's memory.
+        if !self.inner.next.is_null() || self.views.iter().any(|view| !view.next.is_null()) {
+            return None;
+        }
+        let views = self.views.clone();
+        let mut inner = self.inner;
+        inner.views = views.as_ptr();
+        inner.view_count = views.len() as u32;
+        Some(Box::new(DetachedProjection {
+            inner,
+            _views: views,
+        }))
+    }
 }
 impl Default for CompositionLayerProjection<'_> {
     fn default() -> Self {
@@ -273,5 +335,12 @@ unsafe impl<'a> CompositionLayer<'a> for CompositionLayerPassthroughFB {
 
     fn header(&self) -> &sys::CompositionLayerBaseHeader {
         unsafe { mem::transmute(&self.inner) }
+    }
+
+    fn detach(&self) -> Option<Box<dyn DetachedLayer>> {
+        self.inner
+            .next
+            .is_null()
+            .then(|| Box::new(DetachedPassthroughFB(self.inner)) as Box<dyn DetachedLayer>)
     }
 }
